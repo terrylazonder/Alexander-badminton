@@ -20,7 +20,7 @@ MAX_PLAYERS_ON_COURT = MAX_MATCHES * 4  # 24 players
 # -------------------------------------------------------
 
 def gender_icon(g: str) -> str:
-    return "🚹" if g == "M" else "🚺"
+    return "🚹" if g == "M" else "👑"
 
 
 # -------------------------------------------------------
@@ -340,3 +340,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
