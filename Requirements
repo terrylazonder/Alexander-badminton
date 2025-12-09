@@ -4,3 +4,4 @@ plotly
 Pillow
 Numpy
 itertools
+openpyxl
