@@ -1,6 +1,7 @@
 import streamlit as st
 import pandas as pd
 from itertools import combinations
+import random
 
 # -------------------------------------------------------
 # CONFIG
@@ -14,13 +15,16 @@ FILE_PATH = "ratings.xlsx"
 MAX_MATCHES = 6
 MAX_PLAYERS_ON_COURT = MAX_MATCHES * 4  # 24 players
 
+# Default tolerance (slider can override this)
+BALANCE_TOLERANCE = 3
+
 
 # -------------------------------------------------------
 # SMALL HELPERS
 # -------------------------------------------------------
 
 def gender_icon(g: str) -> str:
-    return "🚹" if g == "M" else "👑"
+    return "🚹" if g == "M" else "🚺"
 
 
 # -------------------------------------------------------
@@ -38,12 +42,19 @@ def compute_conflict_score(matches, history_pairs):
     return score
 
 
-def compute_balance_score(matches):
+def compute_balance_score(matches, tolerance=BALANCE_TOLERANCE):
+    """Penalty for unbalanced matches.
+
+    Differences up to `tolerance` are treated as 'equal' (zero penalty).
+    Only the excess beyond tolerance is penalized (squared).
+    """
     total = 0
     for match in matches:
         sum1 = sum(p[RATING_COL] for p in match["team1"])
         sum2 = sum(p[RATING_COL] for p in match["team2"])
-        total += (sum1 - sum2) ** 2
+        diff = abs(sum1 - sum2)
+        excess = max(0, diff - tolerance)
+        total += excess ** 2
     return total
 
 
@@ -55,8 +66,43 @@ def select_players_for_courts(active_df, play_counts, max_players=MAX_PLAYERS_ON
     tmp = active_df.sample(frac=1).reset_index(drop=True)
     tmp["played"] = tmp[NAME_COL].map(lambda n: play_counts.get(n, 0))
     tmp = tmp.sort_values("played")
-
     return tmp.iloc[:max_players].drop(columns=["played"]).reset_index(drop=True)
+
+
+# -------------------------------------------------------
+# TEAM + MATCH HELPERS
+# -------------------------------------------------------
+
+def team_rating(team):
+    return team[0][RATING_COL] + team[1][RATING_COL]
+
+
+def make_matches_from_teams(teams):
+    """Turn a list of 2-player teams into matches.
+
+    Strategy:
+    - Sort teams by team strength to get roughly even matchups.
+    - Within small rating bands (chunks of 4 teams), shuffle to avoid
+      getting the exact same matches every round.
+    """
+    if len(teams) < 2:
+        return []
+    if len(teams) % 2 == 1:
+        teams = teams[:-1]
+
+    teams = sorted(teams, key=team_rating)
+
+    matches = []
+    # Work in small chunks to add variety without ruining balance
+    for i in range(0, len(teams), 4):
+        chunk = teams[i:i + 4]
+        if len(chunk) < 2:
+            continue
+        random.shuffle(chunk)
+        for j in range(0, len(chunk), 2):
+            if j + 1 < len(chunk):
+                matches.append({"team1": chunk[j], "team2": chunk[j + 1]})
+    return matches
 
 
 # -------------------------------------------------------
@@ -71,10 +117,7 @@ def schedule_random(df):
     df = df.iloc[:n]
 
     teams = [[df.iloc[i], df.iloc[i + 1]] for i in range(0, n, 2)]
-    teams.sort(key=lambda t: t[0][RATING_COL] + t[1][RATING_COL])
-
-    return [{"team1": teams[i], "team2": teams[i + 1]}
-            for i in range(0, len(teams), 2) if i + 1 < len(teams)]
+    return make_matches_from_teams(teams)
 
 
 def schedule_gender(df):
@@ -100,44 +143,59 @@ def schedule_gender(df):
     if len(teams) % 2 == 1:
         teams = teams[:-1]
 
-    teams.sort(key=lambda t: t[0][RATING_COL] + t[1][RATING_COL])
-
-    return [{"team1": teams[i], "team2": teams[i + 1]}
-            for i in range(0, len(teams), 2) if i + 1 < len(teams)]
+    return make_matches_from_teams(teams)
 
 
 def schedule_competition(df, split):
+    """
+    Competition:
+    - Prefer strong vs strong and weak vs weak based on split.
+    - BUT if that would produce < 6 matches while there are enough players overall,
+      fill the remaining matches using leftover players from BOTH pools.
+    """
     strong = df[df[RATING_COL] < split].sample(frac=1).reset_index(drop=True)
     weak = df[df[RATING_COL] >= split].sample(frac=1).reset_index(drop=True)
 
-    def make_matches(group, max_m):
-        max_players = max_m * 4
+    def build_matches_from_group(group, max_matches):
+        max_players = max_matches * 4
         n = min(len(group), max_players)
         n = (n // 4) * 4
         if n < 4:
-            return []
-        group = group.iloc[:n]
-        teams = [[group.iloc[i], group.iloc[i + 1]] for i in range(0, n, 2)]
-        teams.sort(key=lambda t: t[0][RATING_COL] + t[1][RATING_COL])
-        return [{"team1": teams[i], "team2": teams[i + 1]}
-                for i in range(0, len(teams), 2) if i + 1 < len(teams)]
+            return [], group.reset_index(drop=True)
 
-    strong_m = make_matches(strong, 3)
-    weak_m = make_matches(weak, 3)
+        used = group.iloc[:n].reset_index(drop=True)
+        left = group.iloc[n:].reset_index(drop=True)
 
-    return (strong_m + weak_m)[:MAX_MATCHES]
+        teams = [[used.iloc[i], used.iloc[i + 1]] for i in range(0, n, 2)]
+        return make_matches_from_teams(teams), left
+
+    # 1) Prefer in-pool matches
+    strong_matches, strong_left = build_matches_from_group(strong, 3)
+    weak_matches, weak_left = build_matches_from_group(weak, 3)
+
+    matches = (strong_matches + weak_matches)[:MAX_MATCHES]
+
+    # 2) If still short, fill using leftovers combined (so you get 6 matches if possible)
+    if len(matches) < MAX_MATCHES:
+        leftovers = pd.concat([strong_left, weak_left], ignore_index=True).sample(frac=1).reset_index(drop=True)
+
+        remaining_needed = MAX_MATCHES - len(matches)
+        fill_matches, _ = build_matches_from_group(leftovers, remaining_needed)
+
+        matches += fill_matches
+
+    return matches[:MAX_MATCHES]
 
 
 # -------------------------------------------------------
 # ROUND GENERATOR
 # -------------------------------------------------------
 
-def generate_round(df, mode, history_pairs, split_rating):
+def generate_round(df, mode, history_pairs, split_rating, balance_tolerance):
     best = None
     best_score = None
 
     for _ in range(200):
-
         if mode == "random":
             matches = schedule_random(df)
         elif mode == "gender":
@@ -150,9 +208,9 @@ def generate_round(df, mode, history_pairs, split_rating):
             continue
 
         conflict = compute_conflict_score(matches, history_pairs)
-        balance = compute_balance_score(matches)
+        balance = compute_balance_score(matches, tolerance=balance_tolerance)
 
-        score = (conflict, balance)
+        score = (conflict, balance)  # lexicographic: prefer fewer conflicts, then better balance
 
         if best is None or score < best_score:
             best = matches
@@ -178,7 +236,7 @@ def update_play_counts(matches, play_counts):
 
 
 # -------------------------------------------------------
-# DISPLAY MATCHES (NO CODE BLOCK)
+# DISPLAY
 # -------------------------------------------------------
 
 def display_matches(matches, active_df):
@@ -271,8 +329,6 @@ def main():
 
     # ---------- TAB 1 ----------
     with tab_info:
-
-        # Show your photo at the top
         st.image("Badminton foto.jpeg", use_container_width=True)
 
         st.subheader("Players")
@@ -284,6 +340,15 @@ def main():
             max_value=100,
             value=24,
             step=1,
+        )
+
+        balance_tolerance = st.slider(
+            "Balance tolerance (rating points treated as equal)",
+            min_value=0,
+            max_value=10,
+            value=BALANCE_TOLERANCE,
+            step=1,
+            help="Differences up to this value between team ratings add 0 balance penalty. Higher = more flexibility / variety.",
         )
 
     # ---------- TAB 2 ----------
@@ -310,28 +375,25 @@ def main():
         col1, col2, col3 = st.columns(3)
         matches_placeholder = st.container()
 
-        # Mixed
         with col1:
             if st.button("Mixed"):
-                matches = generate_round(players_on_court, "gender", history_pairs, split_rating)
+                matches = generate_round(players_on_court, "gender", history_pairs, split_rating, balance_tolerance)
                 with matches_placeholder:
                     display_matches(matches, active_df)
                     update_history(matches, history_pairs)
                     update_play_counts(matches, play_counts)
 
-        # Random
         with col2:
             if st.button("Random"):
-                matches = generate_round(players_on_court, "random", history_pairs, split_rating)
+                matches = generate_round(players_on_court, "random", history_pairs, split_rating, balance_tolerance)
                 with matches_placeholder:
                     display_matches(matches, active_df)
                     update_history(matches, history_pairs)
                     update_play_counts(matches, play_counts)
 
-        # Competition
         with col3:
             if st.button("Competition"):
-                matches = generate_round(players_on_court, "competition", history_pairs, split_rating)
+                matches = generate_round(players_on_court, "competition", history_pairs, split_rating, balance_tolerance)
                 with matches_placeholder:
                     display_matches(matches, active_df)
                     update_history(matches, history_pairs)
